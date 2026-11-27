@@ -1,0 +1,93 @@
+# .clang-tidy -- 32-bit -> 64-bit port checks (ILP32 -> LP64: long, size_t, ptrdiff_t
+# and pointers grow to 64 bits; int stays 32).
+#
+# What it looks for:
+#   * 64->32 truncation: size_t / long / ptrdiff_t / .size() / strlen() / find() stored in
+#     int or unsigned, including `int += long` compound assignments
+#   * 32-bit math that gets widened afterwards (int*int used as a long, or as a pointer offset)
+#   * loop counters narrower than their bound (for (int i = 0; i < v.size(); ++i))
+#   * pointer <-> integer casts, printf/scanf format mismatches (%d with long, %x with a pointer)
+#   * sizeof(pointer) assumptions, malloc(n * sizeof(int)) for an int**, memcmp over padded structs
+#   * constants that no longer fit (0x100000000L into int, x == npos on an unsigned)
+#
+# Run it against compile_commands.json from the 64-bit build. Under -m32 long and int are the
+# same size, so most of these have nothing to find.
+#
+# Expect many lines to show up twice, once as clang-diagnostic-shorten-64-to-32 and once as
+# bugprone-narrowing-conversions. Same bug; both are kept because each catches cases the
+# other misses (narrowing: `int += long`; shorten: truncation into unsigned types).
+#
+# Works with clang-tidy 14 through 23. Unknown top-level keys are a hard error in older
+# versions, so version-specific keys are left commented out below.
+
+Checks: >
+  -*,
+  clang-diagnostic-shorten-64-to-32,
+  clang-diagnostic-constant-conversion,
+  clang-diagnostic-tautological-constant-out-of-range-compare,
+  clang-diagnostic-format,
+  clang-diagnostic-int-to-pointer-cast,
+  clang-diagnostic-int-to-void-pointer-cast,
+  clang-diagnostic-pointer-to-int-cast,
+  clang-diagnostic-void-pointer-to-int-cast,
+  clang-diagnostic-sizeof-pointer-div,
+  clang-diagnostic-sizeof-pointer-memaccess,
+  clang-diagnostic-sizeof-array-argument,
+  clang-diagnostic-shift-count-overflow,
+  bugprone-narrowing-conversions,
+  bugprone-implicit-widening-of-multiplication-result,
+  bugprone-misplaced-widening-cast,
+  bugprone-too-small-loop-variable,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-memory-comparison,
+  clang-analyzer-unix.MallocSizeof
+
+# Audit-level checks: very noisy on a large legacy codebase, but useful for a one-off sweep
+# of a subsystem (e.g. the on-disk persistence code). Add them to Checks to use them:
+#   google-runtime-int                       every short/long/long long -- long is the type that changed size
+#   performance-no-int-to-ptr                every integer -> pointer cast, not just the narrow ones
+#   cppcoreguidelines-pro-type-cstyle-cast   every C-style cast, e.g. the (int)(long)ptr pattern
+
+# clang-diagnostic-* checks only report what the compiler itself emits, and the flags in
+# compile_commands.json are your GCC ones, so turn the relevant warnings on explicitly.
+# -Wno-error stops a -Werror in your build flags from turning these into hard errors.
+ExtraArgs:
+  - -Wno-error
+  - -Wshorten-64-to-32
+  - -Wconstant-conversion
+  - -Wtautological-constant-out-of-range-compare
+  - -Wformat
+  - -Wint-to-pointer-cast
+  - -Wpointer-to-int-cast
+  - -Wsizeof-pointer-div
+  - -Wsizeof-pointer-memaccess
+  - -Wsizeof-array-argument
+  - -Wshift-count-overflow
+
+WarningsAsErrors: ''
+FormatStyle: none
+
+# Report warnings in your own headers too -- shared headers are where most of the hits live.
+# Tighten this to your tree (e.g. '^/path/to/repo/(src|include)/') to skip vendored code.
+HeaderFilterRegex: '.*'
+# clang-tidy 19+ only (older versions reject the key):
+# ExcludeHeaderFilterRegex: '(third_party|external|_deps)/'
+
+CheckOptions:
+  # Only report narrowing *from* types that grew. int -> short and friends behave exactly as
+  # they did in the 32-bit build. Types are matched by the name as written, not through
+  # typedefs, so append your codebase's own 32-bit-or-smaller typedefs (UINT32, DWORD, ...).
+  # Don't add int_fast16_t/int_fast32_t: glibc makes those 64-bit on x86-64.
+  # (clang-tidy 14 only matches the typedef names here, so plain int -> short still shows up.)
+  - key: bugprone-narrowing-conversions.IgnoreConversionFromTypes
+    value: 'bool;char;signed char;unsigned char;wchar_t;char8_t;char16_t;char32_t;short;unsigned short;int;unsigned int;int8_t;uint8_t;int16_t;uint16_t;int32_t;uint32_t;int_least8_t;uint_least8_t;int_least16_t;uint_least16_t;int_least32_t;uint_least32_t;int_fast8_t;uint_fast8_t'
+  - key: bugprone-narrowing-conversions.WarnOnFloatingPointNarrowingConversion
+    value: false
+  - key: bugprone-narrowing-conversions.WarnOnIntegerToFloatingPointNarrowingConversion
+    value: false
+  - key: bugprone-narrowing-conversions.WarnOnEquivalentBitWidth
+    value: false
+  # The default (16) only flags char/short counters; 32 also flags int and unsigned loop
+  # counters compared against a 64-bit bound such as v.size().
+  - key: bugprone-too-small-loop-variable.MagnitudeBitsUpperLimit
+    value: 32
